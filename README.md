@@ -1,6 +1,4 @@
-# parallel-bittorrent-client
-
-# Parallel BitTorrent Client (MPI + OpenMP)
+# Parallel BitTorrent Client (MPI + OpenMP) Team T8
 
 This project is a demonstration of a parallel BitTorrent client implemented in C++ using MPI (Message Passing Interface) for process-level parallelism and OpenMP for multi-threading awareness and specific task parallelization. It utilizes the excellent [libtorrent-rasterbar](https://www.libtorrent.org/) library for the core BitTorrent protocol handling.
 
