@@ -74,11 +74,6 @@ Execute the client using `mpirun`, specifying the number of processes (`-np`) an
     mpirun -np 4 ./bin/parallel_torrent /path/to/your/download.torrent
     ```
 
-*   **Run with 2 processes (1 coordinator, 1 worker) using a magnet link:**
-    ```bash
-    mpirun -np 4 ./bin/parallel_torrent "magnet:?xt=urn:btih:YOUR_TORRENT_INFO_HASH&dn=OptionalName&tr=udp..."
-    ```
-
 *   **Run in single-process mode (Rank 0 does the download):**
     ```bash
     mpirun -np 1 ./bin/parallel_torrent /path/to/your/download.torrent
