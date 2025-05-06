@@ -16,8 +16,9 @@
 #include <system_error>
 #include <cerrno>
 #include <vector>
-#include <sstream> // For potential OMP logging if needed elsewhere
+#include <sstream>
 #include <map>     // For storing worker results
+#include <cmath>   // For std::sin in dummy OpenMP calculation
 
 // --- MPI Header ---
 #include <mpi.h>
@@ -44,21 +45,19 @@
 #include <libtorrent/fwd.hpp>
 #include <libtorrent/address.hpp>
 #include <libtorrent/session_stats.hpp>
-#include <libtorrent/peer_info.hpp>     // Still useful for observing peers
-#include <libtorrent/error_code.hpp>
-#include <libtorrent/close_reason.hpp> // Needed for peer_disconnected_alert
+#include <libtorrent/peer_info.hpp>
+#include <libtorrent/close_reason.hpp>
 
 namespace lt = libtorrent;
 
-// Structure to hold summary data sent from worker to coordinator
+// Structure for worker summary data
 struct WorkerSummary {
     long long total_download_bytes;
     long long total_upload_bytes;
-    char completion_status; // 'D' for Done/Success, 'F' for Failure/Stall
+    char completion_status; // 'D' = Done, 'F' = Failed
 };
 
-
-// Function to get torrent status string
+// Function to convert torrent state enum to string
 std::string state_to_string(lt::torrent_status::state_t s) {
     switch (s) {
         case lt::torrent_status::checking_files: return "checking";
@@ -71,7 +70,7 @@ std::string state_to_string(lt::torrent_status::state_t s) {
     }
 }
 
-// RateTracker struct
+// Helper for calculating rolling average rates
 struct RateTracker {
     std::deque<std::pair<std::chrono::steady_clock::time_point, float>> history;
     std::chrono::seconds window_duration = std::chrono::seconds(10);
@@ -87,51 +86,40 @@ struct RateTracker {
     float get_average_rate() const {
         if (history.size() < 2) return 0.0f;
         float total_rate = 0.0f;
-        for (const auto& p : history) {
-            total_rate += p.second;
-        }
+        for (const auto& p : history) { total_rate += p.second; }
         return total_rate / history.size();
     }
 };
 
-
 // ================================================================
-// Function to handle the download logic for a single torrent (Worker)
+// Torrent Download Logic (Worker)
 // ================================================================
 char download_torrent(const std::string& torrent_input, int mpi_rank, WorkerSummary& summary_data_out) {
-    // --- Initial Setup and Configuration ---
+    // --- Session Setup ---
     std::cout << "[Rank " << mpi_rank << "] Starting download for: " << torrent_input.substr(0, 70) << "..." << std::endl;
-    std::cout << "[Rank " << mpi_rank << "] Using libtorrent version: " << lt::version() << std::endl;
-    lt::settings_pack settings; settings.set_str(lt::settings_pack::user_agent, "MyParallelClient/1.5-MPI+OMP" + std::to_string(mpi_rank)); // Version bump
-    settings.set_bool(lt::settings_pack::enable_dht, true); settings.set_bool(lt::settings_pack::enable_upnp, true); settings.set_bool(lt::settings_pack::enable_natpmp, true);
-    int base_port = 6881; int rank_port = base_port + (mpi_rank * 2); if (rank_port > 65530) rank_port = base_port + (mpi_rank % 100); std::string listen_interfaces_str = "0.0.0.0:" + std::to_string(rank_port) + ",[::]:" + std::to_string(rank_port); settings.set_str(lt::settings_pack::listen_interfaces, listen_interfaces_str);
-    int num_hashing_threads = std::max(1, omp_get_max_threads() / 2); settings.set_int(lt::settings_pack::hashing_threads, num_hashing_threads); std::cout << "[Rank " << mpi_rank << "] Configured libtorrent internal threads: " << num_hashing_threads << " (OMP aware)." << std::endl;
-    // Alert mask - Suppress Perf/Tracker for cleaner logs unless debugging those
+    lt::settings_pack settings;
+    settings.set_str(lt::settings_pack::user_agent, "MyParallelClient/1.6-MPI+OMP" + std::to_string(mpi_rank)); // Version bump
+    settings.set_bool(lt::settings_pack::enable_dht, true);
+    settings.set_bool(lt::settings_pack::enable_upnp, true);
+    settings.set_bool(lt::settings_pack::enable_natpmp, true);
+    int base_port = 6881; int rank_port = base_port + (mpi_rank * 2); if (rank_port > 65530) rank_port = base_port + (mpi_rank % 100);
+    std::string listen_interfaces_str = "0.0.0.0:" + std::to_string(rank_port) + ",[::]:" + std::to_string(rank_port);
+    settings.set_str(lt::settings_pack::listen_interfaces, listen_interfaces_str);
+    int num_hashing_threads = std::max(1, omp_get_max_threads() / 2); settings.set_int(lt::settings_pack::hashing_threads, num_hashing_threads);
+    std::cout << "[Rank " << mpi_rank << "] Configured libtorrent internal threads: " << num_hashing_threads << " (OMP aware)." << std::endl;
     settings.set_int(lt::settings_pack::alert_mask, lt::alert_category::status | lt::alert_category::error | lt::alert_category::storage | lt::alert_category::connect | lt::alert_category::peer | lt::alert_category::stats | lt::alert_category::peer_log);
     lt::session_params params(settings); lt::session ses(params); lt::torrent_handle h;
     std::cout << "[Rank " << mpi_rank << "] libtorrent session started. Listening on: " << listen_interfaces_str << std::endl;
-    lt::add_torrent_params atp; atp.save_path = "./rank_" + std::to_string(mpi_rank) + "_download"; try { std::filesystem::path save_dir(atp.save_path); if (!std::filesystem::exists(save_dir)) { std::filesystem::create_directories(save_dir); } std::cout << "[Rank " << mpi_rank << "] Using save directory: " << std::filesystem::absolute(save_dir).string() << std::endl; } catch (const std::filesystem::filesystem_error& e) { std::cerr << "[Rank " << mpi_rank << "] FS error: " << e.what() << std::endl; return 'F'; }
+
+    // --- Add Torrent ---
+    lt::add_torrent_params atp; atp.save_path = "./rank_" + std::to_string(mpi_rank) + "_download";
+    try { std::filesystem::path save_dir(atp.save_path); if (!std::filesystem::exists(save_dir)) { std::filesystem::create_directories(save_dir); } std::cout << "[Rank " << mpi_rank << "] Using save directory: " << std::filesystem::absolute(save_dir).string() << std::endl; } catch (const std::filesystem::filesystem_error& e) { std::cerr << "[Rank " << mpi_rank << "] FS error: " << e.what() << std::endl; return 'F'; }
     lt::error_code ec; if (torrent_input.rfind("magnet:?", 0) == 0) { lt::parse_magnet_uri(torrent_input, atp, ec); if (ec) { std::cerr << "[Rank " << mpi_rank << "] Error parsing magnet: " << ec.message() << std::endl; return 'F'; } } else { atp.ti = std::make_shared<lt::torrent_info>(torrent_input, std::ref(ec)); if (ec || !atp.ti || !atp.ti->is_valid()) { std::cerr << "[Rank " << mpi_rank << "] Error loading torrent file: " << ec.message() << std::endl; return 'F'; } std::cout << "[Rank " << mpi_rank << "] Torrent file loaded: " << atp.ti->name() << std::endl; }
-    std::cout << "[Rank " << mpi_rank << "] Adding torrent to session..." << std::endl; ses.async_add_torrent(std::move(atp));
+    ses.async_add_torrent(std::move(atp));
 
     // --- Main Loop Variables ---
     bool torrent_added_confirmed = false; bool torrent_finished = false; int loop_count = 0; const int max_loops_without_progress = 300; int loops_since_last_progress = 0; long long last_total_downloaded = 0;
     RateTracker download_rate_tracker; RateTracker upload_rate_tracker;
-    // *** Removed Peer Check State Variables ***
-
-    // --- OpenMP Demonstration Region ---
-    // This region now just demonstrates OMP is active, no critical work inside.
-    #pragma omp parallel
-    {
-        #pragma omp master
-        {
-             // Optional: Print once to show parallel region entered
-             // if (loop_count == 1) std::cout << "[Rank " << mpi_rank << " OMP Master] Parallel region active (Thread Count: " << omp_get_num_threads() << ")" << std::endl;
-        }
-        // Worker threads in the team are idle or could do unrelated work.
-    }
-    // --- End OpenMP Region ---
-
 
     // --- Main Loop ---
     while (!torrent_finished && loops_since_last_progress < max_loops_without_progress ) {
@@ -139,23 +127,44 @@ char download_torrent(const std::string& torrent_input, int mpi_rank, WorkerSumm
         std::vector<lt::alert*> alerts;
         ses.pop_alerts(&alerts);
 
+        // ***** ADDED: OpenMP Demonstration: Dummy Parallel Work *****
+        if (loop_count % 30 == 5 && torrent_added_confirmed) { // Run this infrequent dummy task (e.g., every 30s after torrent added)
+            #pragma omp parallel
+            {
+                #pragma omp master
+                {
+                    std::cout << "[Rank " << mpi_rank << " OMP Master] Starting dummy OpenMP parallel calculation with " << omp_get_num_threads() << " threads." << std::endl;
+                }
+
+                double thread_local_sum = 0.0; // Each thread has its own sum
+                #pragma omp for // Distribute loop iterations
+                for (int i = 0; i < 500000; ++i) { // Reduced iterations for quicker demo
+                    thread_local_sum += std::sin(static_cast<double>(i) * 0.0001 + omp_get_thread_num());
+                }
+
+                // Optionally, do something with thread_local_sum here, e.g., print it under a critical section
+                // #pragma omp critical
+                // {
+                //    std::cout << "[Rank " << mpi_rank << " OMP Thread " << omp_get_thread_num() << "] Dummy calc sum: " << thread_local_sum << std::endl;
+                // }
+            } // End OpenMP parallel region
+            std::cout << "[Rank " << mpi_rank << " OMP Master] Finished dummy OpenMP parallel calculation." << std::endl;
+        }
+        // ***** END: OpenMP Demonstration *****
+
+
         // --- Process Alerts ---
         for (lt::alert* a : alerts) {
             if (auto ata = lt::alert_cast<lt::add_torrent_alert>(a)) { if (ata->error) { std::cerr << "[Rank " << mpi_rank << "] Failed add: " << ata->error.message() << std::endl; return 'F'; } h = ata->handle; lt::torrent_status st = h.status(); std::cout << "[Rank " << mpi_rank << "] >>> Torrent added" << (st.has_metadata ? ": " + st.name : " (pending metadata).") << std::endl; torrent_added_confirmed = true; h.resume(); }
             else if (auto mra = lt::alert_cast<lt::metadata_received_alert>(a)) { h = mra->handle; torrent_added_confirmed = true; lt::torrent_status st = h.status(); std::cout << "[Rank " << mpi_rank << "] >>> Metadata received for: " << st.name << std::endl; }
             else if (auto saa = lt::alert_cast<lt::session_stats_alert>(a)) { (void)saa; }
-            else if (auto sua = lt::alert_cast<lt::state_update_alert>(a)) { if (torrent_added_confirmed && h.is_valid() && !sua->status.empty()) { for(const auto& st : sua->status) { if (st.handle == h) { download_rate_tracker.add_rate(st.download_payload_rate); upload_rate_tracker.add_rate(st.upload_payload_rate); if (loop_count % 5 == 1) { /* Print status */ std::cout << "[Rank " << mpi_rank << "] --- Status (" << (st.has_metadata ? st.name : "<no meta>") << ") ---" << std::endl; std::cout << "  State: " << state_to_string(st.state) << " (" << std::fixed << std::setprecision(1) << (st.progress * 100.0f) << "%) | Peers: " << st.num_peers << " (Seeds: " << st.num_seeds << ")" << std::endl; std::cout << "  Rate DL: " << std::fixed << std::setprecision(1) << (st.download_payload_rate / 1024.0f) << " KiB/s (Avg: " << (download_rate_tracker.get_average_rate() / 1024.0f) << ") | UL: " << (st.upload_payload_rate / 1024.0f) << " KiB/s (Avg: " << (upload_rate_tracker.get_average_rate() / 1024.0f) << ")" << std::endl; std::cout << "  Total DL: " << std::fixed << std::setprecision(2) << (st.total_payload_download / 1024.0f / 1024.0f) << " MiB | UL: " << (st.total_payload_upload / 1024.0f / 1024.0f) << " MiB | Ratio: " << ((st.total_payload_download > 0) ? (double)st.total_payload_upload / st.total_payload_download : 0.0) << std::endl; std::cout << "---------------------------------------" << std::endl; } if (st.total_payload_download > last_total_downloaded) { last_total_downloaded = st.total_payload_download; loops_since_last_progress = 0; } else if (st.state == lt::torrent_status::downloading) { loops_since_last_progress++; } if (!torrent_finished && (st.state == lt::torrent_status::finished || st.state == lt::torrent_status::seeding)) { torrent_finished = true; std::cout << "[Rank " << mpi_rank << "] >>> Torrent finished/seeding: " << st.name << std::endl; } break; } } } }
+            else if (auto sua = lt::alert_cast<lt::state_update_alert>(a)) { if (torrent_added_confirmed && h.is_valid() && !sua->status.empty()) { for(const auto& st : sua->status) { if (st.handle == h) { download_rate_tracker.add_rate(st.download_payload_rate); upload_rate_tracker.add_rate(st.upload_payload_rate); if (loop_count % 5 == 1) { std::cout << "[Rank " << mpi_rank << "] --- Status (" << (st.has_metadata ? st.name : "<no meta>") << ") ---" << std::endl; std::cout << "  State: " << state_to_string(st.state) << " (" << std::fixed << std::setprecision(1) << (st.progress * 100.0f) << "%) | Peers: " << st.num_peers << " (Seeds: " << st.num_seeds << ")" << std::endl; std::cout << "  Rate DL: " << std::fixed << std::setprecision(1) << (st.download_payload_rate / 1024.0f) << " KiB/s (Avg: " << (download_rate_tracker.get_average_rate() / 1024.0f) << ") | UL: " << (st.upload_payload_rate / 1024.0f) << " KiB/s (Avg: " << (upload_rate_tracker.get_average_rate() / 1024.0f) << ")" << std::endl; std::cout << "  Total DL: " << std::fixed << std::setprecision(2) << (st.total_payload_download / 1024.0f / 1024.0f) << " MiB | UL: " << (st.total_payload_upload / 1024.0f / 1024.0f) << " MiB | Ratio: " << ((st.total_payload_download > 0) ? (double)st.total_payload_upload / st.total_payload_download : 0.0) << std::endl; std::cout << "---------------------------------------" << std::endl; } if (st.total_payload_download > last_total_downloaded) { last_total_downloaded = st.total_payload_download; loops_since_last_progress = 0; } else if (st.state == lt::torrent_status::downloading) { loops_since_last_progress++; } if (!torrent_finished && (st.state == lt::torrent_status::finished || st.state == lt::torrent_status::seeding)) { torrent_finished = true; std::cout << "[Rank " << mpi_rank << "] >>> Torrent finished/seeding: " << st.name << std::endl; } break; } } } }
             else if (auto tfa = lt::alert_cast<lt::torrent_finished_alert>(a)) { if (tfa->handle == h) { std::cout << "[Rank " << mpi_rank << "] >>> Alert: Torrent finished: " << tfa->torrent_name() << std::endl; torrent_finished = true; } }
             else if (auto pea = lt::alert_cast<lt::peer_error_alert>(a)) { std::cerr << "[Rank " << mpi_rank << "] Peer Error: " << pea->endpoint << " : " << pea->error.message() << std::endl; }
             else if (auto pda = lt::alert_cast<lt::peer_disconnected_alert>(a)) { std::cout << "[Rank " << mpi_rank << "] Peer Disconnected: " << pda->endpoint << " ReasonCode: " << static_cast<int>(pda->reason) << " Err: " << pda->error.message() << std::endl; }
             else if (lt::alert_cast<lt::save_resume_data_alert>(a) || lt::alert_cast<lt::save_resume_data_failed_alert>(a)) { }
             else { /* Optional: log unhandled alerts */ }
         } // End alert processing loop
-
-
-        // *** REMOVED Periodic Peer Check and Management Block ***
-        // Direct peer disconnection is not available via torrent_handle in lt 2.0
-
 
         // --- Post Updates ---
         if (torrent_added_confirmed && h.is_valid() && loop_count % 5 == 0) { ses.post_torrent_updates(); ses.post_session_stats(); }
@@ -168,13 +177,13 @@ char download_torrent(const std::string& torrent_input, int mpi_rank, WorkerSumm
 
     // --- 5. Session Shutdown ---
     std::cout << "[Rank " << mpi_rank << "] Stopping session..." << std::endl; char final_result_status = 'F';
-    summary_data_out.completion_status = 'F'; summary_data_out.total_download_bytes = 0; summary_data_out.total_upload_bytes = 0; // Initialize summary
-    if (torrent_added_confirmed && h.is_valid()) { std::cout << "[Rank " << mpi_rank << "] Saving resume data..." << std::endl; h.save_resume_data(lt::torrent_handle::save_info_dict); bool resume_saved = false; auto start = std::chrono::steady_clock::now(); while (!resume_saved && std::chrono::steady_clock::now() - start < std::chrono::seconds(10)) { std::vector<lt::alert*> alerts; ses.pop_alerts(&alerts); for (lt::alert* a : alerts) { if (auto sra = lt::alert_cast<lt::save_resume_data_alert>(a)) { if (sra->handle == h) { /* Save logic */ std::filesystem::path resume_filepath; try { std::filesystem::path save_dir(atp.save_path); std::string base_filename; lt::torrent_status st = h.status(); if (st.has_metadata && !st.name.empty()) { std::string safe_name = st.name; std::replace_if(safe_name.begin(), safe_name.end(), [](char c){ return std::string("/\\:*?\"<>|").find(c) != std::string::npos; }, '_'); if (safe_name.length() > 100) safe_name = safe_name.substr(0, 100); base_filename = ".resume_" + safe_name + ".fastresume"; } else { base_filename = ".resume_data_rank" + std::to_string(mpi_rank) + ".fastresume"; } resume_filepath = save_dir / base_filename; std::ofstream of(resume_filepath, std::ios::binary | std::ios::trunc); if (of) { auto const b = write_resume_data_buf(sra->params); of.write(b.data(), b.size()); std::cout << "[Rank " << mpi_rank << "] Resume data saved to " << resume_filepath.string() << std::endl; } else { std::cerr << "[Rank " << mpi_rank << "] Failed open resume file: " << resume_filepath.string() << " (errno: " << errno << ")" << std::endl; } } catch (const std::exception& e) { std::cerr << "[Rank " << mpi_rank << "] Ex saving resume: " << e.what() << std::endl; } resume_saved = true; break; } } else if (auto srfa = lt::alert_cast<lt::save_resume_data_failed_alert>(a)) { if (srfa->handle == h) { std::cerr << "[Rank " << mpi_rank << "] Failed save resume data (alert): " << srfa->error.message() << std::endl; resume_saved = true; break; } } } if (!resume_saved) std::this_thread::sleep_for(std::chrono::milliseconds(200)); } if (!resume_saved) { std::cerr << "[Rank " << mpi_rank << "] Timeout waiting for resume save alert.\n"; } lt::torrent_status final_st = h.status(); final_result_status = (final_st.state == lt::torrent_status::finished || final_st.state == lt::torrent_status::seeding) ? 'D' : ((loops_since_last_progress >= max_loops_without_progress) ? 'F' : 'D'); if (final_result_status == 'D' && !(final_st.state == lt::torrent_status::finished || final_st.state == lt::torrent_status::seeding)) { std::cout << "[Rank " << mpi_rank << "] Final state: " << state_to_string(final_st.state) << std::endl; } summary_data_out.completion_status = final_result_status; summary_data_out.total_download_bytes = final_st.total_payload_download; summary_data_out.total_upload_bytes = final_st.total_payload_upload; } else { std::cerr << "[Rank " << mpi_rank << "] No valid handle. Result=F\n"; final_result_status = 'F'; summary_data_out.completion_status = 'F'; }
+    summary_data_out.completion_status = 'F'; summary_data_out.total_download_bytes = 0; summary_data_out.total_upload_bytes = 0;
+    if (torrent_added_confirmed && h.is_valid()) { std::cout << "[Rank " << mpi_rank << "] Saving resume data..." << std::endl; h.save_resume_data(lt::torrent_handle::save_info_dict); bool resume_saved = false; auto start = std::chrono::steady_clock::now(); while (!resume_saved && std::chrono::steady_clock::now() - start < std::chrono::seconds(10)) { std::vector<lt::alert*> alerts; ses.pop_alerts(&alerts); for (lt::alert* a : alerts) { if (auto sra = lt::alert_cast<lt::save_resume_data_alert>(a)) { if (sra->handle == h) { std::filesystem::path resume_filepath; try { std::filesystem::path save_dir(atp.save_path); std::string base_filename; lt::torrent_status st = h.status(); if (st.has_metadata && !st.name.empty()) { std::string safe_name = st.name; std::replace_if(safe_name.begin(), safe_name.end(), [](char c){ return std::string("/\\:*?\"<>|").find(c) != std::string::npos; }, '_'); if (safe_name.length() > 100) safe_name = safe_name.substr(0, 100); base_filename = ".resume_" + safe_name + ".fastresume"; } else { base_filename = ".resume_data_rank" + std::to_string(mpi_rank) + ".fastresume"; } resume_filepath = save_dir / base_filename; std::ofstream of(resume_filepath, std::ios::binary | std::ios::trunc); if (of) { auto const b = write_resume_data_buf(sra->params); of.write(b.data(), b.size()); std::cout << "[Rank " << mpi_rank << "] Resume data saved to " << resume_filepath.string() << std::endl; } else { std::cerr << "[Rank " << mpi_rank << "] Failed open resume file: " << resume_filepath.string() << " (errno: " << errno << ")" << std::endl; } } catch (const std::exception& e) { std::cerr << "[Rank " << mpi_rank << "] Ex saving resume: " << e.what() << std::endl; } resume_saved = true; break; } } else if (auto srfa = lt::alert_cast<lt::save_resume_data_failed_alert>(a)) { if (srfa->handle == h) { std::cerr << "[Rank " << mpi_rank << "] Failed save resume data (alert): " << srfa->error.message() << std::endl; resume_saved = true; break; } } } if (!resume_saved) std::this_thread::sleep_for(std::chrono::milliseconds(200)); } if (!resume_saved) { std::cerr << "[Rank " << mpi_rank << "] Timeout waiting for resume save alert.\n"; } lt::torrent_status final_st = h.status(); final_result_status = (final_st.state == lt::torrent_status::finished || final_st.state == lt::torrent_status::seeding) ? 'D' : ((loops_since_last_progress >= max_loops_without_progress) ? 'F' : 'D'); if (final_result_status == 'D' && !(final_st.state == lt::torrent_status::finished || final_st.state == lt::torrent_status::seeding)) { std::cout << "[Rank " << mpi_rank << "] Final state: " << state_to_string(final_st.state) << std::endl; } summary_data_out.completion_status = final_result_status; summary_data_out.total_download_bytes = final_st.total_payload_download; summary_data_out.total_upload_bytes = final_st.total_payload_upload; } else { std::cerr << "[Rank " << mpi_rank << "] No valid handle. Result=F\n"; final_result_status = 'F'; summary_data_out.completion_status = 'F'; }
     std::cout << "[Rank " << mpi_rank << "] Pausing session..." << std::endl; ses.pause(); std::cout << "[Rank " << mpi_rank << "] Session shutdown initiated." << std::endl; return final_result_status;
 }
 
 // ================================================================
-// Main function with MPI setup (Handles Summary Struct)
+// Main function with MPI setup
 // ================================================================
 int main(int argc, char* argv[]) {
     MPI_Init(&argc, &argv);
@@ -188,9 +197,7 @@ int main(int argc, char* argv[]) {
          #pragma omp parallel
          {
              #pragma omp master
-             {
-                 std::cout << " OpenMP Max Threads: " << omp_get_num_threads() << std::endl;
-             }
+             { std::cout << " OpenMP Max Threads: " << omp_get_num_threads() << std::endl; }
          }
          std::cout << "========================================" << std::endl;
     }
@@ -220,10 +227,10 @@ int main(int argc, char* argv[]) {
         MPI_Status status; MPI_Probe(0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
         if (status.MPI_TAG == 0) { // Task
             int count; MPI_Get_count(&status, MPI_CHAR, &count); std::vector<char> buf(count); MPI_Recv(buf.data(), count, MPI_CHAR, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE); std::string received_input(buf.data()); std::cout << "[Rank " << world_rank << "] Received task." << std::endl;
-            WorkerSummary summary_to_send; // Create struct to hold results
-            download_torrent(received_input, world_rank, summary_to_send); // Function now populates the struct
+            WorkerSummary summary_to_send;
+            download_torrent(received_input, world_rank, summary_to_send);
             std::cout << "[Rank " << world_rank << "] Task finished. Sending summary (Status: '" << summary_to_send.completion_status << "') to Rank 0." << std::endl;
-            MPI_Send(&summary_to_send, sizeof(WorkerSummary), MPI_BYTE, 0, 2, MPI_COMM_WORLD); // Send struct
+            MPI_Send(&summary_to_send, sizeof(WorkerSummary), MPI_BYTE, 0, 2, MPI_COMM_WORLD);
         } else if (status.MPI_TAG == 1) { /* Shutdown handling */ char dummy; MPI_Recv(&dummy, 0, MPI_CHAR, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE); std::cout << "[Rank " << world_rank << "] Received shutdown signal. Exiting." << std::endl; }
         else { /* Unexpected Tag handling */ std::cerr << "[Rank " << world_rank << "] Unexpected tag " << status.MPI_TAG << "\n"; int count; MPI_Get_count(&status, MPI_CHAR, &count); std::vector<char> buf(count > 0 ? count : 1); MPI_Recv(buf.data(), count, MPI_CHAR, 0, status.MPI_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE); WorkerSummary fail_summary; fail_summary.completion_status = 'F'; fail_summary.total_download_bytes = 0; fail_summary.total_upload_bytes = 0; MPI_Send(&fail_summary, sizeof(WorkerSummary), MPI_BYTE, 0, 2, MPI_COMM_WORLD); }
     }
