@@ -84,17 +84,6 @@ Execute the client using `mpirun`, specifying the number of processes (`-np`) an
     mpirun -np 1 ./bin/parallel_torrent /path/to/your/download.torrent
     ```
 
-## Directory Structure
-.
-├── Makefile # Build script
-├── bin/ # Compiled executable(s)
-│ └── parallel_torrent
-├── build/ # Intermediate object file(s)
-│ └── main.o
-├── include/ # (Optional - currently unused) Header files
-└── src/ # Source code
-└── main.cpp
-
 *(Output directories like `rank_1_download`, `rank_2_download`, etc., will be created in the directory where you run the command)*.
 
 ## Notes
