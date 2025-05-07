@@ -34,7 +34,7 @@ The project emphasizes demonstrating a hybrid parallel approach and accurately m
     *   **Rolling Average Rates:** Calculates and displays average download/upload rates over a configurable time window (10 seconds by default) for smoother performance insights using a `RateTracker`.
     *   **Total Transferred:** Tracks total payload downloaded and uploaded in MiB.
     *   **Upload/Download Ratio:** Calculated for each worker.
-*   **Input Flexibility:** Accepts both `.torrent` files and `magnet:` URIs as input.
+*   **Input Flexibility:** Accepts `.torrent` files as input.
 *   **Resume Capability:** Saves `.fastresume` data for each worker's session, allowing downloads to be potentially resumed later (though full resume logic across MPI restarts is not the primary focus).
 *   **Dynamic Port Allocation:** Each MPI worker listens on a unique port to avoid conflicts.
 *   **Custom User Agent:** Identifies each worker instance uniquely to peers.
@@ -43,7 +43,7 @@ The project emphasizes demonstrating a hybrid parallel approach and accurately m
 ## Technologies Used
 
 *   **C++17:** Core programming language.
-*   **MPI:** For process-level parallelism and inter-process communication (e.g., Open MPI, MPICH).
+*   **MPI:** For process-level parallelism and inter-process communication (e.g., Open MPI).
 *   **OpenMP:** For shared-memory multi-threading within each MPI process.
 *   **libtorrent-rasterbar (v2.0.x):** High-performance C++ library for the BitTorrent protocol.
 
@@ -73,18 +73,13 @@ The project emphasizes demonstrating a hybrid parallel approach and accurately m
 
 Execute the client using `mpirun`. You need to specify:
 *   `-np <N>`: The total number of MPI processes to launch. One process (Rank 0) will act as the coordinator, and the remaining `N-1` processes will be workers. For `N=1`, Rank 0 will perform the download itself.
-*   `<torrent_input>`: The path to a `.torrent` file or a `magnet:` link (ensure magnet links are enclosed in quotes if they contain special shell characters).
+*   `<torrent_input>`: The path to a `.torrent` file.
 
 **Examples:**
 
 *   **Run with 3 processes (1 coordinator, 2 workers) using a torrent file:**
     ```bash
     mpirun -np 3 ./bin/parallel_torrent /path/to/your/large_file.torrent
-    ```
-
-*   **Run with 2 processes (1 coordinator, 1 worker) using a magnet link:**
-    ```bash
-    mpirun -np 2 ./bin/parallel_torrent "magnet:?xt=urn:btih:YOUR_TORRENT_HASH&dn=Example+Torrent"
     ```
 
 *   **Run in single-process mode (Rank 0 downloads directly):**
@@ -98,11 +93,3 @@ Execute the client using `mpirun`. You need to specify:
 *   **Downloaded Files:** Each worker (Rank `X`) will save downloaded files into a directory named `rank_X_download/` created in the current working directory where the command was run. Resume data (`.fastresume` files) will also be saved within these directories.
 *   **Final Summary:** Rank 0 (Coordinator) will print a table summarizing the total download/upload, ratio, and status for each worker once all workers have reported completion or timeout.
 
-## Architectural Notes
-
-*   **MPI for Task Distribution:** MPI is used for the high-level coordination: Rank 0 sends the torrent information to worker ranks, and workers send their final statistics back to Rank 0.
-*   **OpenMP for Intra-Process Parallelism:**
-    *   Within each MPI worker process, OpenMP is used to enable multi-threading.
-    *   `libtorrent` is configured to use a number of internal threads (e.g., for hashing) based on the OpenMP environment (`omp_get_max_threads()`).
-    *   A dummy OpenMP parallel loop is included in the worker's main alert processing loop to demonstrate active OpenMP thread utilization.
-*   **Peer List Management:** Peer discovery, connection, and management (including "changing peer lists" as per the problem statement's suggestion) are handled internally by each `libtorrent::session` based on trackers, DHT, PEX, and peer behavior. This client does not implement custom inter-MPI-rank peer list sharing or manipulation.
